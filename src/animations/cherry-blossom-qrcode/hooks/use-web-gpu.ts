@@ -4,10 +4,21 @@ import { useCallback, useEffect, useRef } from 'react';
 
 import { CanvasRef } from 'react-native-webgpu';
 
-import { LERP_SPEED, MAX_BLOCKS } from '../constants';
+import {
+  BLOCK_SIZE,
+  CREEPER_FUSE_DURATION,
+  CREEPER_TOTAL,
+  CREEPER_WALK_DURATION,
+  DEBRIS_SETTLE,
+  LERP_SPEED,
+  MAX_BLOCKS,
+  REBUILD_DURATION,
+} from '../constants';
 import {
   blocksFragmentShader,
   blocksVertexShader,
+  dustFragmentShader,
+  dustVertexShader,
   shadowFragmentShader,
   shadowVertexShader,
   skyFragmentShader,
@@ -15,10 +26,20 @@ import {
 } from '../shaders';
 import { BlockData } from '../types';
 import { generateBlockData, generateQRMatrix } from '../utils';
+import { approachDestination, pickApproachYaw } from '../utils/approach';
 
 function easeInOutCubic(t: number): number {
   return t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2;
 }
+
+// Where the creeper plants itself, in blocks from the trunk — close enough to
+// gut the tree, far enough out that it does not stand inside the trunk it is
+// about to remove.
+
+// Whole sequence: walk in, fuse, blast, debris settles, tree reassembles.
+const SEQUENCE_DURATION = CREEPER_TOTAL + DEBRIS_SETTLE + REBUILD_DURATION;
+
+const UNIFORM_FLOATS = 16;
 
 interface UseWebGPUOptions {
   canvasRef: React.RefObject<CanvasRef | null>;
@@ -26,6 +47,16 @@ interface UseWebGPUOptions {
   canvasHeight: number;
   qrContent: string;
   isFlat: React.RefObject<boolean>;
+  /**
+   * Fired the frame the fuse begins. The whole detonation haptic is one
+   * pattern played from here, so its beats are timed by the haptic engine
+   * rather than by JS timers racing the sequence clock.
+   */
+  onFuseStart?: () => void;
+  /** Fired the frame the creeper detonates. */
+  onDetonate?: () => void;
+  /** Fired when the tree is whole again and the QR is scannable. */
+  onSequenceEnd?: () => void;
 }
 
 export function useWebGPU({
@@ -34,6 +65,9 @@ export function useWebGPU({
   canvasHeight,
   qrContent,
   isFlat,
+  onFuseStart,
+  onDetonate,
+  onSequenceEnd,
 }: UseWebGPUOptions) {
   const animationRef = useRef<number | null>(null);
   const startTimeRef = useRef<number>(Date.now());
@@ -44,7 +78,7 @@ export function useWebGPU({
   const deviceRef = useRef<GPUDevice | null>(null);
   const typeBufferRef = useRef<GPUBuffer | null>(null);
   const posBufferRef = useRef<GPUBuffer | null>(null);
-  const heightBufferRef = useRef<GPUBuffer | null>(null);
+  const resistanceBufferRef = useRef<GPUBuffer | null>(null);
   const baseYBufferRef = useRef<GPUBuffer | null>(null);
   const blockDataRef = useRef<{ numBlocks: number; gridSize: number }>({
     numBlocks: 0,
@@ -53,15 +87,55 @@ export function useWebGPU({
   const qrContentRef = useRef(qrContent);
   qrContentRef.current = qrContent;
 
+  // The detonation sequence is one clock plus a fixed heading; every visual
+  // downstream is a pure function of them, so nothing can drift out of sync.
+  const sequenceStartRef = useRef<number | null>(null);
+  const spawnAngleRef = useRef(0);
+  const blastPosRef = useRef({ x: 0, z: 0 });
+  const detonatedRef = useRef(false);
+  const fuseStartedRef = useRef(false);
+  const onFuseStartRef = useRef(onFuseStart);
+  onFuseStartRef.current = onFuseStart;
+  const onDetonateRef = useRef(onDetonate);
+  onDetonateRef.current = onDetonate;
+  const onSequenceEndRef = useRef(onSequenceEnd);
+  onSequenceEndRef.current = onSequenceEnd;
+
+  /** Spawns a creeper. Ignored while one is already on its way. */
+  const detonate = useCallback(() => {
+    if (sequenceStartRef.current !== null) return false;
+    // The destination and the walk distance are fixed, so every run takes the
+    // same time and ends in the same place; only the direction it arrives
+    // from is random, and only from headings whose spawn is still on the
+    // platform.
+    const { gridSize } = blockDataRef.current;
+    spawnAngleRef.current = pickApproachYaw(gridSize || 25);
+    const dest = approachDestination();
+    blastPosRef.current = {
+      x: dest.x * BLOCK_SIZE,
+      z: dest.z * BLOCK_SIZE,
+    };
+    detonatedRef.current = false;
+    fuseStartedRef.current = false;
+    sequenceStartRef.current = Date.now();
+    return true;
+  }, []);
+
   // Update buffers when QR content changes
   useEffect(() => {
     const device = deviceRef.current;
     const typeBuffer = typeBufferRef.current;
     const posBuffer = posBufferRef.current;
-    const heightBuffer = heightBufferRef.current;
+    const resistanceBuffer = resistanceBufferRef.current;
     const baseYBuffer = baseYBufferRef.current;
 
-    if (!device || !typeBuffer || !posBuffer || !heightBuffer || !baseYBuffer)
+    if (
+      !device ||
+      !typeBuffer ||
+      !posBuffer ||
+      !resistanceBuffer ||
+      !baseYBuffer
+    )
       return;
 
     const qrMatrix = generateQRMatrix(qrContent);
@@ -69,7 +143,7 @@ export function useWebGPU({
     updateBuffers(device, blockData, {
       typeBuffer,
       posBuffer,
-      heightBuffer,
+      resistanceBuffer,
       baseYBuffer,
     });
     blockDataRef.current = {
@@ -108,7 +182,7 @@ export function useWebGPU({
 
     // Create buffers
     const uniformBuffer = device.createBuffer({
-      size: 32,
+      size: UNIFORM_FLOATS * 4,
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
     });
 
@@ -124,11 +198,11 @@ export function useWebGPU({
     });
     posBufferRef.current = posBuffer;
 
-    const heightBuffer = device.createBuffer({
+    const resistanceBuffer = device.createBuffer({
       size: MAX_BLOCKS * 4,
       usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
     });
-    heightBufferRef.current = heightBuffer;
+    resistanceBufferRef.current = resistanceBuffer;
 
     const baseYBuffer = device.createBuffer({
       size: MAX_BLOCKS * 4,
@@ -140,7 +214,7 @@ export function useWebGPU({
     updateBuffers(device, blockData, {
       typeBuffer,
       posBuffer,
-      heightBuffer,
+      resistanceBuffer,
       baseYBuffer,
     });
 
@@ -181,7 +255,7 @@ export function useWebGPU({
         { binding: 0, resource: { buffer: uniformBuffer } },
         { binding: 1, resource: { buffer: typeBuffer } },
         { binding: 2, resource: { buffer: posBuffer } },
-        { binding: 3, resource: { buffer: heightBuffer } },
+        { binding: 3, resource: { buffer: resistanceBuffer } },
         { binding: 4, resource: { buffer: baseYBuffer } },
       ],
     });
@@ -209,23 +283,25 @@ export function useWebGPU({
       depthCompare: 'always',
     });
 
+    const alphaBlend: GPUBlendState = {
+      color: {
+        srcFactor: 'src-alpha',
+        dstFactor: 'one-minus-src-alpha',
+        operation: 'add',
+      },
+      alpha: {
+        srcFactor: 'one',
+        dstFactor: 'one-minus-src-alpha',
+        operation: 'add',
+      },
+    };
+
     const shadowPipeline = createPipeline(device, format, skyBindGroupLayout, {
       vertex: shadowVertexShader,
       fragment: shadowFragmentShader,
       depthWrite: false,
       depthCompare: 'always',
-      blend: {
-        color: {
-          srcFactor: 'src-alpha',
-          dstFactor: 'one-minus-src-alpha',
-          operation: 'add',
-        },
-        alpha: {
-          srcFactor: 'one',
-          dstFactor: 'one-minus-src-alpha',
-          operation: 'add',
-        },
-      },
+      blend: alphaBlend,
     });
 
     const blocksPipeline = createPipeline(device, format, bindGroupLayout, {
@@ -235,6 +311,15 @@ export function useWebGPU({
       depthCompare: 'less',
     });
 
+    // Smoke and flash sit in FRONT of the debris, so this one draws last and
+    // ignores depth entirely. Its colours are premultiplied.
+    const dustPipeline = createPipeline(device, format, skyBindGroupLayout, {
+      vertex: dustVertexShader,
+      fragment: dustFragmentShader,
+      depthWrite: false,
+      depthCompare: 'always',
+    });
+
     const depthTexture = device.createTexture({
       size: [canvas.width, canvas.height],
       format: 'depth24plus',
@@ -242,6 +327,7 @@ export function useWebGPU({
     });
 
     const aspectRatio = canvas.width / canvas.height;
+    const uniformData = new Float32Array(UNIFORM_FLOATS);
 
     // Render loop
     const render = () => {
@@ -261,17 +347,66 @@ export function useWebGPU({
       const time = (now - startTimeRef.current) / 1000;
       const { numBlocks, gridSize } = blockDataRef.current;
 
+      // ---- Creeper timeline ------------------------------------------
+      let creeperT = -1;
+      let fuseT = 0;
+      let blastT = -1;
+      let rebuildT = 0;
+      let creeperAlpha = 0;
+
+      const startedAt = sequenceStartRef.current;
+      if (startedAt !== null) {
+        const seq = (now - startedAt) / 1000;
+
+        if (seq < CREEPER_WALK_DURATION) {
+          creeperT = seq / CREEPER_WALK_DURATION;
+          creeperAlpha = 1;
+        } else if (seq < CREEPER_TOTAL) {
+          creeperT = 1;
+          fuseT = (seq - CREEPER_WALK_DURATION) / CREEPER_FUSE_DURATION;
+          creeperAlpha = 1;
+          if (!fuseStartedRef.current) {
+            fuseStartedRef.current = true;
+            onFuseStartRef.current?.();
+          }
+        } else {
+          // Consumed by its own charge.
+          blastT = seq - CREEPER_TOTAL;
+          if (!detonatedRef.current) {
+            detonatedRef.current = true;
+            onDetonateRef.current?.();
+          }
+          const settleEnd = DEBRIS_SETTLE;
+          if (blastT > settleEnd) {
+            rebuildT = Math.min((blastT - settleEnd) / REBUILD_DURATION, 1);
+          }
+        }
+
+        if (seq >= SEQUENCE_DURATION) {
+          sequenceStartRef.current = null;
+          onSequenceEndRef.current?.();
+          creeperT = -1;
+          fuseT = 0;
+          blastT = -1;
+          rebuildT = 0;
+          creeperAlpha = 0;
+        }
+      }
+
       // Update uniforms
-      const uniformData = new Float32Array([
-        aspectRatio,
-        time,
-        numBlocks,
-        progressRef.current,
-        gridSize,
-        0,
-        0,
-        0,
-      ]);
+      uniformData[0] = aspectRatio;
+      uniformData[1] = time;
+      uniformData[2] = numBlocks;
+      uniformData[3] = progressRef.current;
+      uniformData[4] = gridSize;
+      uniformData[5] = creeperT;
+      uniformData[6] = fuseT;
+      uniformData[7] = blastT;
+      uniformData[8] = blastPosRef.current.x;
+      uniformData[9] = blastPosRef.current.z;
+      uniformData[10] = rebuildT;
+      uniformData[11] = creeperAlpha;
+      uniformData[12] = spawnAngleRef.current;
       device.queue.writeBuffer(uniformBuffer, 0, uniformData);
 
       // Render
@@ -310,6 +445,14 @@ export function useWebGPU({
       renderPass.setBindGroup(0, bindGroup);
       renderPass.draw(36 * numBlocks);
 
+      // Vanilla's explosion particle ball, over everything. One fullscreen
+      // triangle; it early-outs per pixel outside the cluster.
+      if (blastT >= 0) {
+        renderPass.setPipeline(dustPipeline);
+        renderPass.setBindGroup(0, skyBindGroup);
+        renderPass.draw(3);
+      }
+
       renderPass.end();
       device.queue.submit([commandEncoder.finish()]);
       context.present();
@@ -327,6 +470,8 @@ export function useWebGPU({
       if (animationRef.current) cancelAnimationFrame(animationRef.current);
     };
   }, [initWebGPU]);
+
+  return { detonate };
 }
 
 // Helper functions
@@ -337,11 +482,11 @@ function updateBuffers(
   buffers: {
     typeBuffer: GPUBuffer;
     posBuffer: GPUBuffer;
-    heightBuffer: GPUBuffer;
+    resistanceBuffer: GPUBuffer;
     baseYBuffer: GPUBuffer;
   },
 ) {
-  const { types, positions, heights, baseY } = blockData;
+  const { types, positions, resistance, baseY } = blockData;
 
   const paddedTypes = new Uint32Array(MAX_BLOCKS);
   paddedTypes.set(types);
@@ -351,9 +496,9 @@ function updateBuffers(
   paddedPositions.set(positions);
   device.queue.writeBuffer(buffers.posBuffer, 0, paddedPositions);
 
-  const paddedHeights = new Float32Array(MAX_BLOCKS);
-  paddedHeights.set(heights);
-  device.queue.writeBuffer(buffers.heightBuffer, 0, paddedHeights);
+  const paddedResistance = new Float32Array(MAX_BLOCKS);
+  paddedResistance.set(resistance);
+  device.queue.writeBuffer(buffers.resistanceBuffer, 0, paddedResistance);
 
   const paddedBaseY = new Float32Array(MAX_BLOCKS);
   paddedBaseY.set(baseY);

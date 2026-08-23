@@ -1,8 +1,9 @@
-import { PALETTE } from '../constants';
-import { uniformsStruct, wgslVec3 } from './helpers';
+import { BLOCK_SIZE, PALETTE } from '../constants';
+import { shaderUtils, uniformsStruct, wgslVec3 } from './helpers';
 
 export const blocksFragmentShader = /* wgsl */ `
 ${uniformsStruct}
+${shaderUtils}
 
 struct BlockInput {
   @location(0) uv: vec2f,
@@ -10,17 +11,26 @@ struct BlockInput {
   @location(2) faceNy: f32,
   @location(3) faceNz: f32,
   @location(4) blockType: f32,
-  @location(5) blockH: f32,
+  @location(5) charge: f32,
   @location(6) col: f32,
   @location(7) row: f32,
   @location(8) layer: f32,
+  @location(9) partId: f32,
+  @location(10) modelFront: f32,
 }
 
 @group(0) @binding(0) var<uniform> uniforms: Uniforms;
 
+const BLOCK = ${BLOCK_SIZE};
+
 fn acesFilm(x: vec3f) -> vec3f {
   let a = 2.51; let b = 0.03; let c = 2.43; let d = 0.59; let e = 0.14;
   return clamp((x * (a * x + b)) / (x * (c * x + d) + e), vec3f(0.0), vec3f(1.0));
+}
+
+// Axis-aligned rect test in the creeper's 8x8 face grid.
+fn faceRect(p: vec2f, x0: f32, y0: f32, x1: f32, y1: f32) -> bool {
+  return p.x >= x0 && p.x < x1 && p.y >= y0 && p.y < y1;
 }
 
 @fragment
@@ -55,6 +65,32 @@ fn main(input: BlockInput) -> @location(0) vec4f {
   let grassDark = vec3f(0.05, 0.18, 0.04);
   let grassMid = vec3f(0.07, 0.28, 0.05);
   let grassBright = vec3f(0.12, 0.38, 0.08);
+
+  // Creeper — vanilla's two-tone mottled green.
+  // Creeper skin, matched to the real texture rather than pushed for contrast.
+  // The mob is a BRIGHT light-to-mid green with a TIGHT value spread and
+  // desaturated grey-green patches through it - darkening and saturating it to
+  // separate it from the pale lawn made it read as a different creature. The
+  // separation comes from the block-edge shading below instead.
+  // More saturated than a straight read of the texture: ACES plus the gamma
+  // curve lift these a long way, and values sampled from a screenshot came out
+  // mint rather than green once tonemapped.
+  //
+  // The spread between tones is wide on purpose. The contrast that makes a
+  // creeper look like a creeper is BETWEEN patches, not around each cube - so
+  // it lives here, in how far apart neighbouring voxels sit, rather than in
+  // edge shading that outlines every block.
+  // Saturated rather than lightened. The lawn's own green is dark and dull
+  // and the path is near-white, so what separates the mob from the ground is
+  // how GREEN it is - pushing the value instead just walks it towards the
+  // white modules it is standing on.
+  let creeperBright = vec3f(0.53, 0.97, 0.39);
+  let creeperPale = vec3f(0.38, 0.85, 0.27);
+  let creeperLight = vec3f(0.26, 0.73, 0.18);
+  let creeperMid = vec3f(0.16, 0.58, 0.11);
+  let creeperDark = vec3f(0.07, 0.37, 0.06);
+  // Only the very bottom of the legs goes near-black, as on the real skin.
+  let creeperFoot = vec3f(0.10, 0.22, 0.08);
 
   // ============================================
   // LIGHTING SETUP
@@ -103,12 +139,69 @@ fn main(input: BlockInput) -> @location(0) vec4f {
   let canopyAO = 0.65 + layerRatio * 0.35;
 
   var albedo = vec3f(0.5);
+  // Set on the creeper's face pixels so the fuse strobe cannot white them out.
+  var creeperFace = 0.0;
+
+  // ============================================
+  // CREEPER — shaded apart from the tree: it is a mob, not terrain.
+  // ============================================
+  if (blockType == 5) {
+    // Vanilla's mottle: a coarse per-voxel two-tone, biased darker down the
+    // legs so it grounds instead of floating.
+    // Five tones across a wide band, so the patchwork actually reads.
+    var skin = creeperMid;
+    if (noise1 < 0.16) {
+      skin = creeperBright;
+    } else if (noise1 < 0.38) {
+      skin = creeperLight;
+    } else if (noise1 < 0.58) {
+      skin = creeperDark;
+    } else if (noise1 < 0.74) {
+      skin = creeperPale;
+    }
+    // A second, independent scatter so patches do not fall into obvious bands.
+    skin = mix(skin, creeperBright, step(0.90, noise2) * 0.75);
+    skin = mix(skin, creeperDark, step(0.93, noise3) * 0.7);
+    // Feet: the dark patches sit on the lowest leg course only, not over the
+    // whole limb.
+    if (input.partId >= 2.0 && layer < 0.5) {
+      skin = mix(skin, creeperFoot, 0.55 + 0.45 * step(0.5, noise2));
+    }
+
+    // The face fills the front of the head as one 8x8 texture spread over
+    // the 4x4 voxels, exactly like the real skin.
+    if (input.partId < 0.5 && input.modelFront > 0.5) {
+      let px = ((input.col + 2.0) + uv.x) * 2.0;
+      let py = ((3.0 - (layer - 9.0)) + (1.0 - uv.y)) * 2.0;
+      let p = vec2f(px, py);
+      let isFace =
+        faceRect(p, 1.0, 2.0, 3.0, 4.0) ||
+        faceRect(p, 5.0, 2.0, 7.0, 4.0) ||
+        faceRect(p, 3.0, 4.0, 5.0, 5.0) ||
+        faceRect(p, 2.0, 5.0, 6.0, 6.0) ||
+        faceRect(p, 2.0, 6.0, 3.0, 7.0) ||
+        faceRect(p, 5.0, 6.0, 6.0, 7.0);
+      if (isFace) {
+        skin = vec3f(0.02, 0.03, 0.02);
+      }
+    }
+
+    // Cheap directional shading so the cube silhouette still reads.
+    let mobShade = 0.42 + max(dot(N, sunDir), 0.0) * 0.58 + NdUp * 0.12;
+    // Darkened block edges, so the silhouette holds against a pale background
+    // instead of dissolving into it.
+    let mobEdge = min(min(uv.x, 1.0 - uv.x), min(uv.y, 1.0 - uv.y));
+    // Barely there. Any real edge darkening outlines every single voxel, which
+    // is exactly the kind of contrast this should NOT have; the skin's
+    // definition comes from the patch-to-patch spread above instead.
+    let mobAO = mix(0.94, 1.0, smoothstep(0.0, 0.10, mobEdge));
+    albedo = skin * mobShade * mobAO;
 
   // ============================================
   // TOP FACE - What QR scanner sees in 2D
   // ============================================
 
-  if (input.faceNy > 0.5) {
+  } else if (input.faceNy > 0.5) {
     let topWarmTint = vec3f(1.1, 1.08, 1.02);
 
     if (blockType == 0) {
@@ -293,7 +386,9 @@ fn main(input: BlockInput) -> @location(0) vec4f {
       if (t < 0.3) {
         grassColor = mix(grassBright, grassMid, t / 0.3);
       } else if (t < 0.6) {
-        grassColor = mix(grassMid, grassDark, (t - 0.6) / 0.3);
+        // Was (t - 0.6) / 0.3 — a negative factor that extrapolated the mix
+        // and made mid-range grass sides read brighter than the top faces.
+        grassColor = mix(grassMid, grassDark, (t - 0.3) / 0.3);
       } else if (t < 0.8) {
         grassColor = mix(grassDark, grassBrown, (t - 0.6) / 0.2);
       } else {
@@ -339,6 +434,52 @@ fn main(input: BlockInput) -> @location(0) vec4f {
 
   let diffuse = albedo * (ambient + sunCol * NdSun * 0.65 + skyFill * NdUp * 0.25 + bounce * 0.2);
   var hdr = diffuse;
+
+  // ---- Fuse: the creeper flashes white at an accelerating rate ----
+  if (blockType == 5) {
+    let fuse = clamp(uniforms.fuseT, 0.0, 1.0);
+    if (fuse > 0.0) {
+      let rate = mix(2.2, 15.0, fuse * fuse);
+      let strobe = step(0.5, fract(uniforms.time * rate));
+      // Hold back on the face and keep the flash under full white, so the mob
+      // still has a silhouette at the moment it matters most. Blowing it out
+      // to a featureless slab loses the one frame everybody screenshots.
+      let flash = strobe * smoothstep(0.02, 0.85, fuse) * 0.62 * (1.0 - creeperFace * 0.85);
+      hdr = mix(hdr, vec3f(1.25, 1.24, 1.18), flash);
+    }
+  }
+
+  // ---- Aftermath: soot, crater scorch, embers, fireball -----------
+  let blastT = uniforms.blastT;
+  if (blastT >= 0.0 && blockType != 5) {
+    // Grid-space distance to the detonation, from the block's ORIGINAL cell —
+    // debris carries the scorch it picked up where it was standing.
+    let bCol = uniforms.blastX / BLOCK + gridSize * 0.5;
+    let bRow = uniforms.blastZ / BLOCK + gridSize * 0.5;
+    let dGrid = length(vec2f(input.col - bCol, input.row - bRow));
+
+    let fade = 1.0 - clamp(uniforms.rebuildT * 1.35, 0.0, 1.0);
+    // Scorch is a property of WHERE a block stood, not of how fast it left —
+    // driving it from the impulse painted the whole canopy black as soon as
+    // the blast was strong enough to actually throw the tree.
+    let heightFalloff = 1.0 - smoothstep(5.0, 20.0, layer);
+    let crater = (1.0 - smoothstep(3.0, 13.0, dGrid)) * heightFalloff;
+    let soot = clamp(crater * 0.9, 0.0, 1.0) * fade;
+    hdr = mix(hdr, hdr * vec3f(0.17, 0.14, 0.13) + vec3f(0.012, 0.009, 0.008), soot);
+
+    // Embers on a SPARSE set of blocks. Glowing every sooted block just added
+    // an orange wash that cancelled the char and left the crater looking
+    // washed out rather than burnt.
+    let isEmber = step(0.84, noise3);
+    let emberLife = exp(-blastT * 1.15) * fade;
+    let flicker = 0.4 + 0.6 * sin(uniforms.time * 11.0 + noise2 * 42.0);
+    hdr += vec3f(1.0, 0.32, 0.06) * soot * isEmber * emberLife * flicker * 0.7;
+
+    // The fireball itself: hot, tight, and gone in a couple of frames.
+    let fireball = exp(-blastT * 11.0) * (1.0 - smoothstep(0.0, 9.0, dGrid));
+    hdr += vec3f(1.7, 1.2, 0.62) * fireball;
+  }
+
   hdr = acesFilm(hdr * 1.05);
   hdr = pow(hdr, vec3f(1.0 / 2.2));
 
